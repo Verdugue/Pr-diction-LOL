@@ -140,6 +140,22 @@ def get_match_timeline(match_id: str) -> dict | None:
     return data
 
 
+def get_champion_mastery(puuid: str, champion_id: int, region: str = "euw1") -> dict | None:
+    """Retourne la mastery d'un joueur sur un champion donné.
+
+    Endpoint platform (euw1, na1, kr, ...), pas regional (europe, americas, ...).
+
+    Retour : {championPoints, championLevel, lastPlayTime, ...} ou None si :
+      - le joueur n'a jamais joué ce champ (Riot renvoie 404)
+      - clé invalide / rate limit (géré par _get)
+    """
+    url = (
+        f"https://{region}.api.riotgames.com"
+        f"/lol/champion-mastery/v4/champion-masteries/by-puuid/{puuid}/by-champion/{champion_id}"
+    )
+    return _get(url)
+
+
 def get_player_team(info: dict, puuid: str) -> str:
     for p in info.get("info", {}).get("participants", []):
         if p.get("puuid") == puuid:
