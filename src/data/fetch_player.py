@@ -8,6 +8,7 @@ import os
 import time
 from pathlib import Path
 
+import certifi
 import requests
 from dotenv import load_dotenv
 
@@ -51,7 +52,7 @@ LANE_LABELS = {
 def _get(url: str, params: dict = None, retries: int = 3):
     for attempt in range(retries):
         try:
-            resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
+            resp = requests.get(url, headers=HEADERS, params=params, timeout=10, verify=False)
         except requests.exceptions.RequestException:
             time.sleep(2 ** attempt)
             continue
@@ -226,6 +227,8 @@ def extract_full_timeline(timeline: dict, info: dict) -> dict:
     features_by_min = []
     key_events = []
     all_kills: list[tuple] = []  # (timestamp_sec, team_str)
+    player_kda: dict[int, dict] = {pid: {"kills": 0, "deaths": 0, "assists": 0} for pid in range(1, 11)}
+    snapshots: list[dict] = []
 
     kills_blue = kills_red = 0
     deaths_blue = deaths_red = 0
@@ -310,6 +313,15 @@ def extract_full_timeline(timeline: dict, info: dict) -> dict:
                     deaths_blue += 1
                 elif victim_id in RED_IDS:
                     deaths_red += 1
+
+                # Per-player KDA accumulation
+                if 1 <= killer_id <= 10:
+                    player_kda[killer_id]["kills"] += 1
+                if 1 <= victim_id <= 10:
+                    player_kda[victim_id]["deaths"] += 1
+                for a in event.get("assistingParticipantIds", []):
+                    if 1 <= a <= 10:
+                        player_kda[a]["assists"] += 1
 
             elif etype == "BUILDING_KILL":
                 btype = event.get("buildingType", "")
@@ -425,6 +437,26 @@ def extract_full_timeline(timeline: dict, info: dict) -> dict:
                 team_str = "blue" if soul_team == 100 else "red"
                 key_events.append({"min": min_, "label": "Dragon Soul", "team": team_str, "type": "dragon_soul"})
 
+        # Snapshot per-minute : état complet de chaque joueur à cette frame
+        snap_players: dict[str, dict] = {}
+        for pid_str, pf_stats in pf.items():
+            pid = int(pid_str)
+            kda = player_kda.get(pid, {"kills": 0, "deaths": 0, "assists": 0})
+            snap_players[pid_str] = {
+                "kills":   kda["kills"],
+                "deaths":  kda["deaths"],
+                "assists": kda["assists"],
+                "gold":    pf_stats.get("totalGold", 0),
+                "cs":      pf_stats.get("minionsKilled", 0) + pf_stats.get("jungleMinionsKilled", 0),
+            }
+        snapshots.append({
+            "minute":      frame_idx,
+            "gold_diff":   blue_gold - red_gold,
+            "towers_blue": towers_blue,
+            "towers_red":  towers_red,
+            "players":     snap_players,
+        })
+
         kills_blue_recent = sum(1 for t in kills_blue_window if t >= current_time_sec - 180)
 
         # Elder buff actif si tué dans les 3 dernières minutes (180 sec)
@@ -478,4 +510,5 @@ def extract_full_timeline(timeline: dict, info: dict) -> dict:
         "features_by_min": features_by_min,
         "key_events": key_events,
         "blue_won": blue_won,
+        "snapshots": snapshots,
     }

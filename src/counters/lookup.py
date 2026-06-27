@@ -9,6 +9,7 @@ par lane lors du début de partie.
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 
@@ -87,6 +88,32 @@ def get_matchup_score(champion_a: str, champion_b: str) -> float | None:
     return None
 
 
+def get_matchup_data(champion_a: str, champion_b: str) -> dict | None:
+    """Retourne {'wr': float, 'n_games': int} du WR de A contre B, ou None si inconnu.
+
+    Même logique de fallback que get_matchup_score : cherche dans A puis dans B (inversé).
+    """
+    db = load_counters()
+    if not db:
+        return None
+
+    a_key, b_key = _norm(champion_a), _norm(champion_b)
+
+    a_data = db.get(a_key)
+    if a_data:
+        for entry in a_data.get("weak_against", []) + a_data.get("strong_against", []):
+            if _norm(entry["champion"]) == b_key:
+                return {"wr": float(entry["wr_against"]), "n_games": int(entry["n_games"])}
+
+    b_data = db.get(b_key)
+    if b_data:
+        for entry in b_data.get("weak_against", []) + b_data.get("strong_against", []):
+            if _norm(entry["champion"]) == a_key:
+                return {"wr": 100.0 - float(entry["wr_against"]), "n_games": int(entry["n_games"])}
+
+    return None
+
+
 def get_champion_data(champion: str) -> dict | None:
     """Retourne le dict complet d'un champion (role, weak_against, strong_against) ou None."""
     db = load_counters()
@@ -94,6 +121,27 @@ def get_champion_data(champion: str) -> dict | None:
 
 
 LANE_ORDER = ["top", "jungle", "mid", "adc", "support"]
+
+# Poids par rôle : reflect l'impact moyen sur l'issue de la partie (5v5).
+# Jungle et mid ont un impact global (roaming, vision, dragon control).
+# Support est fort en engage mais peu de carry solo.
+LANE_WEIGHTS: dict[str, float] = {
+    "jungle":  0.28,
+    "mid":     0.26,
+    "top":     0.20,
+    "adc":     0.16,
+    "support": 0.10,
+}
+
+_CONF_REF = 5_000  # n_games à partir duquel la confiance est considérée saturée
+
+
+def _confidence(n_games: int) -> float:
+    """Score de confiance logarithmique dans [0, 1].
+    Un matchup à 500 games → ~0.65, à 5000 games → 1.0.
+    Évite qu'un matchup à 80 games pèse autant qu'un à 10 000.
+    """
+    return min(1.0, math.log1p(n_games) / math.log1p(_CONF_REF))
 
 
 def _role_of(champion: str) -> str:
@@ -150,23 +198,51 @@ def compute_pregame_matchup(state: dict) -> dict | None:
     red_g = group_by_role(red)
 
     lanes: list[dict] = []
-    wrs: list[float] = []
     for role in LANE_ORDER:
         bs = blue_g.get(role, [])
         rs = red_g.get(role, [])
-        for b, r in zip(bs, rs):  # pair autant que possible sur la lane
-            wr = get_matchup_score(b, r)
-            lanes.append({"role": role, "blue": b, "red": r, "wr_blue": wr})
-            if wr is not None:
-                wrs.append(wr)
+        for b, r in zip(bs, rs):
+            data        = get_matchup_data(b, r)
+            wr          = data["wr"]      if data else None
+            n_games     = data["n_games"] if data else None
+            role_weight = LANE_WEIGHTS.get(role, 0.20)
+            conf        = _confidence(n_games) if n_games else 0.0
+            delta       = (wr - 50.0) / 100.0 if wr is not None else None
+            lanes.append({
+                "role":           role,
+                "blue":           b,
+                "red":            r,
+                "wr_blue":        wr,
+                "n_games":        n_games,
+                "role_weight":    role_weight,
+                "confidence":     round(conf, 3),
+                # contribution nette au score final (positif = avantage blue)
+                "weighted_delta": round(role_weight * conf * delta, 4) if delta is not None else None,
+            })
+
+    # ── Moyenne pondérée rôle × confiance ──────────────────────────────────────
+    resolved   = [l for l in lanes if l["wr_blue"] is not None]
+    total_w    = sum(l["role_weight"] * l["confidence"] for l in resolved)
+
+    if resolved and total_w > 0:
+        raw_delta    = sum(l["role_weight"] * l["confidence"] * (l["wr_blue"] - 50.0) / 100.0
+                           for l in resolved) / total_w
+        # Clampage : le champ-select ne peut pas dépasser ±15 pts de WR
+        p_blue       = max(0.35, min(0.65, 0.5 + raw_delta))
+        avg_wr_blue  = round(p_blue * 100, 2)   # rétrocompat (en %)
+    else:
+        raw_delta   = None
+        p_blue      = None
+        avg_wr_blue = None
 
     return {
-        "blue_champs": blue,
-        "red_champs": red,
-        "lanes": lanes,
-        "avg_wr_blue": sum(wrs) / len(wrs) if wrs else None,
-        "n_resolved": len(wrs),
-        "n_lanes": len(lanes),
+        "blue_champs":  blue,
+        "red_champs":   red,
+        "lanes":        lanes,
+        "avg_wr_blue":  avg_wr_blue,   # rétrocompat — maintenant pondéré
+        "p_blue_champ": p_blue,        # probabilité directement utilisable [0,1]
+        "n_resolved":   len(resolved),
+        "n_lanes":      len(lanes),
     }
 
 

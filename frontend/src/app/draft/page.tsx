@@ -2,6 +2,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, Loader2, X, Search, Shield, Swords, AlertTriangle } from "lucide-react";
+import { MatchupInfoButton, type MatchupBreakdown } from "@/components/MatchupPopup";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -24,6 +25,7 @@ interface DraftResult {
   red_pairs: PairDetail[];
   blue_off_meta: OffMetaDetail[];
   red_off_meta: OffMetaDetail[];
+  matchup_breakdown: MatchupBreakdown | null;
 }
 
 function ChampionPicker({
@@ -228,9 +230,16 @@ export default function DraftPage() {
           </div>
           {loading
             ? <Loader2 size={18} className="animate-spin" style={{ color: "var(--gold)" }} />
-            : <span className="text-2xl font-black tabular-nums" style={{ color: probColor }}>
-                {result ? `${prob.toFixed(1)}%` : "—"}
-              </span>
+            : (
+              <div className="relative flex items-center gap-1.5">
+                <span className="text-2xl font-black tabular-nums" style={{ color: probColor }}>
+                  {result ? `${prob.toFixed(1)}%` : "—"}
+                </span>
+                {result?.matchup_breakdown && (
+                  <MatchupInfoButton breakdown={result.matchup_breakdown} />
+                )}
+              </div>
+            )
           }
           <div className="flex items-center gap-1.5">
             {result && (

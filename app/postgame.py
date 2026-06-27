@@ -198,16 +198,57 @@ with col_detail:
                 yshift=20,
             )
 
-    # Moment de bascule : première minute > 75% ou < 25%
-    for i, (m, p) in enumerate(zip(minutes, probas_player)):
-        if p > 0.75 or p < 0.25:
-            fig.add_vrect(
-                x0=m, x1=min(m+5, minutes[-1]),
-                fillcolor=color_line, opacity=0.06,
-                annotation_text=f"{'Avantage décisif' if p > 0.75 else 'Situation critique'}",
-                annotation_position="top left",
-            )
-            break
+    # ── Zones décisives avec hysteresis ─────────────────────────────────────────
+    def find_decisive_zones(mins, probs, thr_hi=0.75, thr_lo=0.25,
+                            hysteresis=0.10, min_dur=4):
+        """
+        Détecte les fenêtres où la proba reste décisivement haute/basse.
+        hysteresis : il faut tomber sous (thr_hi - hysteresis) pour quitter
+                     une zone haute — absorbe les mini-dips sans couper la zone.
+        min_dur    : durée minimum en minutes pour qu'une zone soit retenue.
+        """
+        zones, in_zone, z0, zd = [], False, None, None
+        ex_hi, ex_lo = thr_hi - hysteresis, thr_lo + hysteresis
+        for i, (m, p) in enumerate(zip(mins, probs)):
+            if not in_zone:
+                if   p > thr_hi: in_zone, z0, zd = True, i, "high"
+                elif p < thr_lo: in_zone, z0, zd = True, i, "low"
+            else:
+                exiting = (zd == "high" and p < ex_hi) or (zd == "low" and p > ex_lo)
+                if exiting:
+                    dur = mins[i - 1] - mins[z0]
+                    zp  = probs[z0:i]
+                    if dur >= min_dur:
+                        zones.append({
+                            "start": mins[z0], "end": mins[i - 1],
+                            "peak": max(zp) if zd == "high" else min(zp),
+                            "duration": dur, "dir": zd,
+                        })
+                    in_zone = False
+                    if   p > thr_hi: in_zone, z0, zd = True, i, "high"
+                    elif p < thr_lo: in_zone, z0, zd = True, i, "low"
+        if in_zone and z0 is not None:
+            dur, zp = mins[-1] - mins[z0], probs[z0:]
+            if dur >= min_dur:
+                zones.append({
+                    "start": mins[z0], "end": mins[-1],
+                    "peak": max(zp) if zd == "high" else min(zp),
+                    "duration": dur, "dir": zd,
+                })
+        return zones
+
+    decisive_zones = find_decisive_zones(minutes, probas_player)
+
+    for z in decisive_zones:
+        label   = "Avantage décisif" if z["dir"] == "high" else "Situation critique"
+        opacity = min(0.05 + z["duration"] * 0.004, 0.18)
+        fig.add_vrect(
+            x0=z["start"], x1=z["end"],
+            fillcolor=color_line, opacity=opacity,
+            layer="below",
+            annotation_text=f"{label} ({z['duration']} min)",
+            annotation_position="top left",
+        )
 
     fig.update_layout(
         title=f"Probabilité de victoire — minute par minute",
@@ -219,6 +260,20 @@ with col_detail:
         showlegend=False,
     )
     st.plotly_chart(fig, use_container_width=True)
+
+    # ── Résumé zones décisives ──────────────────────────────────────────────────
+    st.subheader("🔍 Quand la partie a-t-elle été jouée ?")
+    if decisive_zones:
+        for z in decisive_zones:
+            emoji    = "🔵" if z["dir"] == "high" else "🔴"
+            team_lbl = "ton équipe dominait" if z["dir"] == "high" else "l'adversaire dominait"
+            peak_pct = int(z["peak"] * 100)
+            st.markdown(
+                f"{emoji} **{z['start']} → {z['end']} min** — "
+                f"{z['duration']} min de contrôle · pic à **{peak_pct}%** · {team_lbl}"
+            )
+    else:
+        st.caption("Aucune fenêtre décisive prolongée — partie équilibrée jusqu'au bout.")
 
     # ── Moments clés texte ──────────────────────────────────────────────────────
     st.subheader("Moments clés")

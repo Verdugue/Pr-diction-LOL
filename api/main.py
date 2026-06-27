@@ -22,6 +22,7 @@ from src.data.fetch_player import (
 )
 from src.models.predict import predict_win_probability, get_advice
 from src.features.build_features import FEATURE_COLS
+from src.counters.lookup import get_matchup_data, LANE_WEIGHTS, _confidence
 
 import joblib
 import numpy as np
@@ -182,7 +183,18 @@ def get_game(match_id: str, player_team: str = "blue"):
     key_events = game_data["key_events"]
     blue_won = game_data["blue_won"]
 
-    # Courbe de probabilité minute par minute
+    # Matchup pré-game depuis les compositions (calculé avant la courbe pour le point minute 0)
+    participants = info["info"].get("participants", [])
+    blue_slots = [
+        SlotInput(champion=p["championName"], role=p.get("teamPosition", ""))
+        for p in participants if p.get("teamId") == 100 and p.get("championName")
+    ]
+    red_slots = [
+        SlotInput(champion=p["championName"], role=p.get("teamPosition", ""))
+        for p in participants if p.get("teamId") == 200 and p.get("championName")
+    ]
+    pregame_matchup = _compute_matchup_breakdown(blue_slots, red_slots)
+
     curve = []
     for snap in features_by_min:
         if snap["minute"] < 3:
@@ -195,6 +207,7 @@ def get_game(match_id: str, player_team: str = "blue"):
             "player_win_prob": round(p_player * 100, 1),
             "gold_diff": snap["gold_diff"],
             "kills_diff": snap["kills_diff"],
+            "is_pregame": False,
         })
 
     # Analyse "qui est fautif / qui a carry"
@@ -205,8 +218,10 @@ def get_game(match_id: str, player_team: str = "blue"):
         "blue_won": blue_won,
         "duration_min": round(info["info"].get("gameDuration", 0) / 60, 1),
         "curve": curve,
-        "key_events": key_events[:20],
+        "key_events": key_events,
         "blame": blame,
+        "pregame_matchup": pregame_matchup,
+        "snapshots": game_data.get("snapshots", []),
     }
 
 
@@ -414,7 +429,7 @@ def get_pro_game(match_id: str, player_team: str = "blue", region: str = "kr"):
         "blue_won": blue_won,
         "duration_min": round(info["info"].get("gameDuration", 0) / 60, 1),
         "curve": curve,
-        "key_events": key_events[:20],
+        "key_events": key_events,
         "blame": blame,
         "is_pro": True,
     }
@@ -550,6 +565,55 @@ class DraftInput(BaseModel):
     red: list[SlotInput]
 
 
+_RIOT_ROLE_TO_COUNTER = {
+    "TOP": "top", "JUNGLE": "jungle", "MIDDLE": "mid",
+    "BOTTOM": "adc", "UTILITY": "support",
+}
+
+
+def _compute_matchup_breakdown(blue_slots: list[SlotInput], red_slots: list[SlotInput]) -> dict:
+    """Calcule le détail matchup par lane (counter data OP.GG) avec pondération rôle × confiance."""
+    blue_by_role = {s.role: s.champion for s in blue_slots if s.champion and s.role}
+    red_by_role  = {s.role: s.champion for s in red_slots  if s.champion and s.role}
+
+    lanes = []
+    for riot_role, counter_role in _RIOT_ROLE_TO_COUNTER.items():
+        b = blue_by_role.get(riot_role)
+        r = red_by_role.get(riot_role)
+        if not b or not r:
+            continue
+        data    = get_matchup_data(b, r)
+        wr      = data["wr"]      if data else None
+        n_games = data["n_games"] if data else None
+        rw      = LANE_WEIGHTS.get(counter_role, 0.20)
+        conf    = _confidence(n_games) if n_games else 0.0
+        delta   = (wr - 50.0) / 100.0 if wr is not None else None
+        lanes.append({
+            "role":           counter_role,
+            "blue":           b,
+            "red":            r,
+            "wr_blue":        round(wr, 1) if wr is not None else None,
+            "n_games":        n_games,
+            "role_weight":    rw,
+            "confidence":     round(conf, 3),
+            "weighted_delta": round(rw * conf * delta, 4) if delta is not None else None,
+        })
+
+    resolved = [l for l in lanes if l["wr_blue"] is not None]
+    total_w  = sum(l["role_weight"] * l["confidence"] for l in resolved)
+
+    if resolved and total_w > 0:
+        raw_delta = sum(
+            l["role_weight"] * l["confidence"] * (l["wr_blue"] - 50.0) / 100.0
+            for l in resolved
+        ) / total_w
+        p_matchup = round(max(0.35, min(0.65, 0.5 + raw_delta)), 4)
+    else:
+        p_matchup = None
+
+    return {"lanes": lanes, "p_matchup": p_matchup, "n_resolved": len(resolved)}
+
+
 @app.post("/draft/predict")
 def draft_predict(draft: DraftInput):
     """
@@ -606,14 +670,17 @@ def draft_predict(draft: DraftInput):
     raw = 0.5 + (blue_syn - red_syn) * 3.0
     blue_prob = max(0.1, min(0.9, raw))
 
+    matchup = _compute_matchup_breakdown(draft.blue, draft.red)
+
     return {
         "blue_win_probability": round(blue_prob * 100, 1),
-        "blue_synergy":   round(blue_syn * 100, 1),
-        "red_synergy":    round(red_syn * 100, 1),
-        "blue_pairs":     blue_pairs,
-        "red_pairs":      red_pairs,
-        "blue_off_meta":  blue_off,
-        "red_off_meta":   red_off,
+        "blue_synergy":         round(blue_syn * 100, 1),
+        "red_synergy":          round(red_syn * 100, 1),
+        "blue_pairs":           blue_pairs,
+        "red_pairs":            red_pairs,
+        "blue_off_meta":        blue_off,
+        "red_off_meta":         red_off,
+        "matchup_breakdown":    matchup,
     }
 
 
