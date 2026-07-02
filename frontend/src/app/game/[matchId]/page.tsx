@@ -26,10 +26,12 @@ interface MinuteSnapshot {
   minute: number; gold_diff: number; towers_blue: number; towers_red: number;
   players: Record<string, PlayerSnap>;
 }
+interface PlayerAnalysis { facts: string[]; advice: string[]; }
 interface GameData {
   match_id: string; blue_won: boolean; duration_min: number;
   curve: CurvePoint[]; key_events: KeyEvent[]; blame: BlamePlayer[];
   pregame_matchup: MatchupBreakdown | null; snapshots: MinuteSnapshot[];
+  player_analysis: Record<string, PlayerAnalysis>;
 }
 
 interface DecisiveZone {
@@ -350,7 +352,11 @@ function EventRow({ event, playerTeam }: { event: KeyEvent; playerTeam: string }
   );
 }
 
-function BlameRow({ player, rank, teamWon }: { player: BlamePlayer; rank: number; teamWon: boolean }) {
+function BlameRow({ player, rank, teamWon, analysis, defaultOpen = false }: {
+  player: BlamePlayer; rank: number; teamWon: boolean;
+  analysis?: PlayerAnalysis; defaultOpen?: boolean;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
   const isFautif = player.impact_score < -5;
   const isCarry  = player.impact_score > 15;
   const accent   = isCarry ? "var(--blue)" : isFautif ? "var(--red)" : "var(--muted)";
@@ -358,40 +364,85 @@ function BlameRow({ player, rank, teamWon }: { player: BlamePlayer; rank: number
   const maxImpact = 80;
   const barW     = Math.min(Math.abs(player.impact_score) / maxImpact * 100, 100);
 
-  // Badge pour 1er de chaque liste
-  const badge = rank === 1
-    ? teamWon ? "MVP" : "Fautif #1"
-    : null;
+  const badge = rank === 1 ? (teamWon ? "MVP" : "Fautif #1") : null;
   const badgeColor = teamWon ? "var(--gold)" : "var(--red)";
+  const hasAnalysis = analysis && (analysis.facts.length > 0 || analysis.advice.length > 0);
 
   return (
-    <div className="flex items-center gap-3 py-3 px-2 rounded-lg transition-colors"
-      style={{ borderBottom: "1px solid var(--border)", background: rowBg }}>
-      <ChampionAvatar name={player.champion} size={34} />
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2 mb-0.5">
-          <span className="font-bold text-sm truncate">{player.champion}</span>
-          {badge && (
-            <span className="text-xs px-1.5 py-0.5 rounded font-bold shrink-0"
-              style={{ background: `${badgeColor}20`, color: badgeColor, fontSize: 10 }}>
-              {badge}
+    <div style={{ borderBottom: "1px solid var(--border)" }}>
+      <div
+        className="flex items-center gap-3 py-3 px-2 rounded-lg transition-colors"
+        style={{ background: rowBg, cursor: hasAnalysis ? "pointer" : "default" }}
+        onClick={() => hasAnalysis && setOpen(v => !v)}
+      >
+        <ChampionAvatar name={player.champion} size={34} />
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 mb-0.5">
+            <span className="font-bold text-sm truncate">{player.champion}</span>
+            {badge && (
+              <span className="text-xs px-1.5 py-0.5 rounded font-bold shrink-0"
+                style={{ background: `${badgeColor}20`, color: badgeColor, fontSize: 10 }}>
+                {badge}
+              </span>
+            )}
+            {hasAnalysis && (
+              <span className="text-xs ml-auto shrink-0" style={{ color: "var(--muted)", opacity: 0.6 }}>
+                {open ? "▲" : "▼"} analyse
+              </span>
+            )}
+          </div>
+          <span className="text-xs truncate block" style={{ color: "var(--muted)" }}>{player.name}</span>
+          <div className="flex items-center gap-2 mt-1.5">
+            <div className="flex-1 h-1 rounded-full" style={{ background: "var(--bg)" }}>
+              <div className="h-full rounded-full" style={{ width: `${barW}%`, background: accent }} />
+            </div>
+            <span className="text-xs font-mono font-bold shrink-0 w-10 text-right" style={{ color: accent }}>
+              {player.impact_score > 0 ? "+" : ""}{player.impact_score}
             </span>
+          </div>
+        </div>
+        <div className="text-right shrink-0">
+          <p className="font-mono text-xs font-semibold">{player.kda_str}</p>
+          <p className="text-xs" style={{ color: "var(--muted)" }}>{player.kill_participation}% KP</p>
+        </div>
+      </div>
+
+      {/* Analyse contextuelle */}
+      {open && hasAnalysis && (
+        <div className="mx-2 mb-3 rounded-xl overflow-hidden"
+          style={{ border: "1px solid rgba(232,64,87,0.2)", background: "rgba(232,64,87,0.04)" }}>
+          {analysis!.facts.length > 0 && (
+            <div className="px-4 pt-3 pb-2">
+              <p className="text-xs font-bold tracking-widest uppercase mb-2" style={{ color: "var(--red)" }}>
+                Ce qui s'est passé
+              </p>
+              <ul className="space-y-1.5">
+                {analysis!.facts.map((f, i) => (
+                  <li key={i} className="text-xs flex gap-2" style={{ color: "var(--text)" }}>
+                    <span style={{ color: "var(--red)", flexShrink: 0 }}>•</span>
+                    <span>{f}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {analysis!.advice.length > 0 && (
+            <div className="px-4 py-3" style={{ borderTop: "1px solid rgba(232,196,112,0.15)" }}>
+              <p className="text-xs font-bold tracking-widest uppercase mb-2" style={{ color: "var(--gold)" }}>
+                À retenir
+              </p>
+              <ul className="space-y-1.5">
+                {analysis!.advice.map((a, i) => (
+                  <li key={i} className="text-xs flex gap-2" style={{ color: "var(--text)" }}>
+                    <span style={{ color: "var(--gold)", flexShrink: 0 }}>→</span>
+                    <span>{a}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
           )}
         </div>
-        <span className="text-xs truncate block" style={{ color: "var(--muted)" }}>{player.name}</span>
-        <div className="flex items-center gap-2 mt-1.5">
-          <div className="flex-1 h-1 rounded-full" style={{ background: "var(--bg)" }}>
-            <div className="h-full rounded-full" style={{ width: `${barW}%`, background: accent }} />
-          </div>
-          <span className="text-xs font-mono font-bold shrink-0 w-10 text-right" style={{ color: accent }}>
-            {player.impact_score > 0 ? "+" : ""}{player.impact_score}
-          </span>
-        </div>
-      </div>
-      <div className="text-right shrink-0">
-        <p className="font-mono text-xs font-semibold">{player.kda_str}</p>
-        <p className="text-xs" style={{ color: "var(--muted)" }}>{player.kill_participation}% KP</p>
-      </div>
+      )}
     </div>
   );
 }
@@ -630,7 +681,9 @@ export default function GamePage({ params }: { params: Promise<{ matchId: string
                   : <Skull size={13} className="ml-auto" style={{ color: "var(--red)" }} />}
               </div>
               {myTeam.map((p, i) => (
-                <BlameRow key={p.pid} player={p} rank={i + 1} teamWon={myTeamWon} />
+                <BlameRow key={p.pid} player={p} rank={i + 1} teamWon={myTeamWon}
+                  analysis={data.player_analysis?.[String(p.pid)]}
+                  defaultOpen={!myTeamWon && i === 0} />
               ))}
             </div>
 
@@ -645,7 +698,9 @@ export default function GamePage({ params }: { params: Promise<{ matchId: string
                   : <Skull size={13} className="ml-auto" style={{ color: "var(--red)" }} />}
               </div>
               {oppTeam.map((p, i) => (
-                <BlameRow key={p.pid} player={p} rank={i + 1} teamWon={oppTeamWon} />
+                <BlameRow key={p.pid} player={p} rank={i + 1} teamWon={oppTeamWon}
+                  analysis={data.player_analysis?.[String(p.pid)]}
+                  defaultOpen={!oppTeamWon && i === 0} />
               ))}
             </div>
           </div>

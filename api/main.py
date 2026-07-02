@@ -211,7 +211,9 @@ def get_game(match_id: str, player_team: str = "blue"):
         })
 
     # Analyse "qui est fautif / qui a carry"
-    blame = _compute_blame(timeline, info, blue_won)
+    blame    = _compute_blame(timeline, info, blue_won)
+    snapshots = game_data.get("snapshots", [])
+    player_analysis = _compute_player_analysis(timeline, info, key_events, snapshots)
 
     return {
         "match_id": match_id,
@@ -221,7 +223,8 @@ def get_game(match_id: str, player_team: str = "blue"):
         "key_events": key_events,
         "blame": blame,
         "pregame_matchup": pregame_matchup,
-        "snapshots": game_data.get("snapshots", []),
+        "snapshots": snapshots,
+        "player_analysis": player_analysis,
     }
 
 
@@ -304,6 +307,192 @@ def _compute_blame(timeline: dict, info: dict, blue_won: bool) -> list[dict]:
 
     result.sort(key=lambda x: x["impact_score"], reverse=True)
     return result
+
+
+_ROLE_LABEL = {"TOP": "top", "JUNGLE": "jungler", "MIDDLE": "mid", "BOTTOM": "ADC", "UTILITY": "support"}
+
+
+def _compute_player_analysis(
+    timeline: dict,
+    info: dict,
+    key_events: list[dict],
+    snapshots: list[dict],
+) -> dict[str, dict]:
+    """Analyse contextuelle des morts par joueur : objectifs, tueurs récurrents, impact gold."""
+    participants = {p["participantId"]: p for p in info["info"]["participants"]}
+    frames = timeline.get("info", {}).get("frames", [])
+
+    snap_by_min: dict[int, dict] = {s["minute"]: s for s in snapshots}
+    max_snap = max(snap_by_min.keys(), default=0)
+
+    OBJECTIVE_TYPES = {"dragon", "baron", "dragon_soul", "elder_dragon", "rift_herald"}
+    objective_events = [e for e in key_events if e["type"] in OBJECTIVE_TYPES]
+
+    deaths_by_pid: dict[int, list[dict]] = {pid: [] for pid in range(1, 11)}
+    killer_counts: dict[int, dict[int, int]] = {pid: {} for pid in range(1, 11)}
+
+    for frame in frames:
+        for event in frame.get("events", []):
+            if event.get("type") != "CHAMPION_KILL":
+                continue
+            victim = event.get("victimId", 0)
+            killer = event.get("killerId", 0)
+            if not (1 <= victim <= 10):
+                continue
+
+            ts_min = event.get("timestamp", 0) / 60000
+
+            # Fenêtre ±1.5 min (plus précise que ±2)
+            near_obj = next(
+                (o for o in objective_events if abs(ts_min - o["min"]) <= 1.5), None
+            )
+
+            snap_min = min(int(ts_min), max_snap)
+            snap_players = snap_by_min.get(snap_min, {}).get("players", {})
+            killer_gold = snap_players.get(str(killer), {}).get("gold", 0) if killer else 0
+            victim_gold = snap_players.get(str(victim), {}).get("gold", 0)
+
+            killer_champ = participants.get(killer, {}).get("championName", "?") if killer else "?"
+
+            deaths_by_pid[victim].append({
+                "minute":    round(ts_min, 1),
+                "killer_pid": killer,
+                "killer_champ": killer_champ,
+                "near_obj":  near_obj,
+                "gold_delta": killer_gold - victim_gold,
+            })
+
+            if killer and 1 <= killer <= 10:
+                killer_counts[victim][killer] = killer_counts[victim].get(killer, 0) + 1
+
+    analysis: dict[str, dict] = {}
+
+    for pid in range(1, 11):
+        deaths   = deaths_by_pid[pid]
+        n_deaths = len(deaths)
+        p_info   = participants.get(pid, {})
+        role     = p_info.get("teamPosition", "")
+        rl       = _ROLE_LABEL.get(role, "")
+        kills    = p_info.get("kills", 0)
+        assists  = p_info.get("assists", 0)
+        # Heuristique "joueur positif" : kills+assists >> morts
+        is_positive = (kills + assists) >= n_deaths * 2 and n_deaths < 6
+
+        facts:  list[str] = []
+        advice: list[str] = []
+
+        if n_deaths == 0:
+            analysis[str(pid)] = {"facts": facts, "advice": advice}
+            continue
+
+        obj_deaths  = [d for d in deaths if d["near_obj"]]
+        obj_ratio   = len(obj_deaths) / n_deaths
+
+        # ── Fait 1 : morts sur timing objectif ───────────────────────────────
+        # Seuil : min 3 morts obj OU 50%+ des morts, et non-pertinent pour joueurs positifs <3 obj deaths
+        if obj_deaths and (len(obj_deaths) >= 3 or obj_ratio >= 0.5) and not (is_positive and len(obj_deaths) < 4):
+            obj_mins  = ", ".join(f"{int(d['minute'])}m" for d in obj_deaths[:5])
+            uniq_objs = list(dict.fromkeys(d["near_obj"]["label"] for d in obj_deaths))[:3]
+            facts.append(
+                f"{len(obj_deaths)}/{n_deaths} morts lors de combats d'objectifs "
+                f"({', '.join(uniq_objs)}) — à {obj_mins}"
+            )
+            if role == "JUNGLE":
+                advice.append(
+                    f"En tant que jungler, setup la vision côté ennemi 2 min avant chaque objectif. "
+                    "N'engage que si tu as la vision complète et le chiffre en ta faveur — "
+                    "mourir en essayant de prendre un objectif non sécurisé fait perdre les deux."
+                )
+            elif role == "UTILITY":
+                advice.append(
+                    "Warde les accès ennemis vers l'objectif 2 minutes avant son apparition. "
+                    "Communique l'info à ton équipe et recule si vous n'êtes pas en bonne position — "
+                    "forcer un combat déséquilibré sur un objectif est souvent pire que de le laisser."
+                )
+            elif role == "BOTTOM":
+                advice.append(
+                    "2 minutes avant chaque drake ou baron, replie-toi vers ta team plutôt que de rester en lane. "
+                    "Ta survie dans le teamfight d'objectif pèse plus que quelques CS supplémentaires."
+                )
+            elif role == "TOP":
+                advice.append(
+                    "Anticipe les timings d'objectifs pour rejoindre ta team ou avoir ton TP disponible. "
+                    "Rester bloqué en top lane lors d'un combat de drake met ton équipe en sous-nombre."
+                )
+            else:
+                advice.append(
+                    "Rejoins ton équipe en avance sur les timings d'objectifs. "
+                    "Chaque mort lors d'un combat d'objectif coûte double : la mort ET potentiellement l'objectif."
+                )
+
+        # ── Fait 2 : tueur récurrent ─────────────────────────────────────────
+        if killer_counts[pid]:
+            top_kpid  = max(killer_counts[pid], key=killer_counts[pid].get)
+            top_count = killer_counts[pid][top_kpid]
+            top_champ = participants.get(top_kpid, {}).get("championName", "?")
+
+            if top_count >= 3:
+                relevant   = [d for d in deaths if d["killer_pid"] == top_kpid]
+                avg_delta  = int(sum(d["gold_delta"] for d in relevant) / len(relevant))
+                death_mins = ", ".join(f"{int(d['minute'])}m" for d in relevant[:5])
+
+                if abs(avg_delta) > 500:
+                    gold_ctx = (
+                        f" — à ces moments, {top_champ} avait en moyenne "
+                        f"{abs(avg_delta):,}g {'d\'avance' if avg_delta > 0 else 'de retard'} sur toi"
+                    )
+                else:
+                    gold_ctx = ""
+
+                facts.append(
+                    f"Tué {top_count} fois par {top_champ} (à {death_mins}){gold_ctx}"
+                )
+
+                if top_count >= 6:
+                    advice.append(
+                        f"{top_champ} t'a tué {top_count} fois — ce duel est perdu. "
+                        "Ne t'expose plus seul contre cet adversaire : joue groupé et attends un teamfight "
+                        "pour avoir de l'aide autour de toi."
+                    )
+                elif top_count >= 4:
+                    advice.append(
+                        f"Tu n'es pas en mesure de gagner les duels contre {top_champ} dans cet état du jeu. "
+                        "Demande un camp à ton jungler sur cette lane, joue sous ta tour et attends des ressources."
+                    )
+                else:
+                    advice.append(
+                        f"Adapte ton positionnement face à {top_champ} : "
+                        "limite les trades en dehors de ta zone de sécurité "
+                        "et communique avec ton jungler pour un gank sur ce matchup."
+                    )
+
+        # ── Fait 3 : volume de morts élevé ───────────────────────────────────
+        if n_deaths >= 8:
+            bounty_est = 300 + min(n_deaths // 3, 5) * 50
+            facts.append(
+                f"{n_deaths} morts au total — en moyenne ~{bounty_est}g par mort remis à l'ennemi, "
+                f"soit ~{n_deaths * bounty_est:,}g de gold cadeau sur la partie"
+            )
+            advice.append(
+                f"Avec {n_deaths} morts, tu as offert une quantité de gold décisive à l'adversaire. "
+                "Identifie les patterns où tu meurs — duels perdus, overextend, mauvais timing — "
+                "et adopte un style de jeu plus conservateur sur les 5 prochaines minutes critiques."
+            )
+
+        # ── Fait 4 : KDA nul avec beaucoup de morts ──────────────────────────
+        if n_deaths >= 5 and (kills + assists) <= 2:
+            facts.append(
+                f"Ratio offensif très faible : {kills} kills et {assists} assists pour {n_deaths} morts — "
+                "ton impact net sur la partie est négatif"
+            )
+            advice.append(
+                "Focusse-toi sur des actions à faible risque : farm sécurisé, wards, aides défensives. "
+                "Cherche à survivre et à rendre les combats plus équilibrés plutôt qu'à forcer des plays."
+            )
+
+        analysis[str(pid)] = {"facts": facts, "advice": advice}
+
+    return analysis
 
 
 # ─── Section Pro ─────────────────────────────────────────────────────────────
